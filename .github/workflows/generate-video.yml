@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       script_path:
-        description: "Path to the script .txt file in this repo"
+        description: "Path to an EXISTING .txt file already committed in this repo, e.g. scripts/example_script.txt (NOT the script text itself)"
         required: false
         default: "scripts/example_script.txt"
       voice:
@@ -24,6 +24,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -38,14 +40,28 @@ jobs:
 
       - name: Determine script path
         id: pick
+        env:
+          INPUT_SCRIPT_PATH: ${{ github.event.inputs.script_path }}
         run: |
-          if [ -n "${{ github.event.inputs.script_path }}" ]; then
-            echo "path=${{ github.event.inputs.script_path }}" >> "$GITHUB_OUTPUT"
+          if [ -n "$INPUT_SCRIPT_PATH" ]; then
+            RAW="$INPUT_SCRIPT_PATH"
           else
-            # push-triggered: use the changed script file
-            CHANGED=$(git diff --name-only HEAD^ HEAD -- 'scripts/*.txt' | head -n 1)
-            echo "path=${CHANGED:-scripts/example_script.txt}" >> "$GITHUB_OUTPUT"
+            RAW=$(git diff --name-only HEAD^ HEAD -- 'scripts/*.txt' 2>/dev/null | head -n 1)
+            RAW="${RAW:-scripts/example_script.txt}"
           fi
+
+          LEN=${#RAW}
+          if [ "$LEN" -gt 200 ] || [ "$(printf '%s' "$RAW" | wc -l)" -gt 0 ] || [[ "$RAW" != *.txt ]]; then
+            echo "::error::The 'script_path' input must be a short path to a .txt file already committed in this repo (example: scripts/example_script.txt) - not the script text itself. Add your script as a file under scripts/ first, then enter its path here."
+            exit 1
+          fi
+
+          if [ ! -f "$RAW" ]; then
+            echo "::error::No file found at '$RAW' in this repo. Commit your script under scripts/ first (e.g. scripts/my_script.txt), then re-run with that path."
+            exit 1
+          fi
+
+          echo "path=$RAW" >> "$GITHUB_OUTPUT"
 
       - name: Generate video
         run: |
