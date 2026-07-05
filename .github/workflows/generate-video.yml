@@ -1,0 +1,63 @@
+name: Generate AI Video
+
+on:
+  # Runs automatically whenever a script file is added/edited
+  push:
+    paths:
+      - "scripts/**.txt"
+  # Lets you trigger it manually from the Actions tab, choosing which script to render
+  workflow_dispatch:
+    inputs:
+      script_path:
+        description: "Path to the script .txt file in this repo"
+        required: false
+        default: "scripts/example_script.txt"
+      voice:
+        description: "Optional: override TTS voice (e.g. fa-IR-DilaraNeural, ja-JP-NanamiNeural)"
+        required: false
+        default: ""
+
+jobs:
+  build-video:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Determine script path
+        id: pick
+        run: |
+          if [ -n "${{ github.event.inputs.script_path }}" ]; then
+            echo "path=${{ github.event.inputs.script_path }}" >> "$GITHUB_OUTPUT"
+          else
+            # push-triggered: use the changed script file
+            CHANGED=$(git diff --name-only HEAD^ HEAD -- 'scripts/*.txt' | head -n 1)
+            echo "path=${CHANGED:-scripts/example_script.txt}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate video
+        run: |
+          EXTRA_ARGS=""
+          if [ -n "${{ github.event.inputs.voice }}" ]; then
+            EXTRA_ARGS="--voice ${{ github.event.inputs.voice }}"
+          fi
+          python generate_video.py --script "${{ steps.pick.outputs.path }}" --out output/final_video.mp4 $EXTRA_ARGS
+
+      - name: Upload video artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: output/final_video.mp4
+          retention-days: 14
