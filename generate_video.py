@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Free AI Long-Form Video Generator
+Free AI Animated Video Generator
 ----------------------------------
-Turns a plain-text script into a narrated video: AI-generated images (Pollinations.ai),
-AI voiceover with word-accurate captions (edge-tts), Ken Burns motion, and optional
-background music -- all stitched together with ffmpeg.
-
-No paid APIs. No API keys required.
+Turns a plain-text script into a video of YOUR character actually talking:
+real word-accurate lip-sync (Rhubarb Lip Sync), blinking, a subtle idle bob,
+and AI-generated scene backgrounds behind it (Pollinations.ai) -- all free,
+no API keys, fully automatable.
 
 Usage:
     python generate_video.py --script scripts/example_script.txt --out output/final_video.mp4
@@ -14,9 +13,9 @@ Usage:
 
 import argparse
 import asyncio
-import os
+import json
+import math
 import random
-import re
 import shutil
 import subprocess
 import sys
@@ -26,37 +25,22 @@ from urllib.parse import quote
 
 import requests
 import edge_tts
+from PIL import Image
 
 DEFAULT_VOICE = "en-US-AriaNeural"
-DEFAULT_WIDTH = 1920
-DEFAULT_HEIGHT = 1080
-DEFAULT_FPS = 25
-WORDS_PER_CAPTION = 6
+CANVAS_W, CANVAS_H = 1920, 1080
+FPS = 25
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
+CHARACTER_DIR = Path(__file__).parent / "assets" / "character"
 
+VISEME_MAP = {
+    "A": "closed", "B": "closed", "G": "closed", "X": "closed",
+    "C": "mid", "E": "mid", "F": "mid", "H": "mid",
+    "D": "wide",
+}
 
-# --------------------------------------------------------------------------
-# 1. Script parsing
-# --------------------------------------------------------------------------
 
 def parse_script(path: str):
-    """
-    Script format:
-
-        VOICE: en-US-AriaNeural
-        MUSIC: assets/lofi.mp3
-
-        ---
-        IMAGE: a cozy coffee shop window on a rainy day, warm light, aesthetic
-        Rain taps gently against the window as steam rises from a fresh cup of coffee.
-        ---
-        IMAGE: person journaling by candlelight, cozy bedroom
-        There's something quietly powerful about writing your thoughts down before bed.
-
-    Header lines (VOICE / MUSIC) before the first '---' are optional global settings.
-    Each scene block optionally starts with "IMAGE: <prompt>". If omitted, the
-    narration text itself is used as the image prompt.
-    """
     raw = Path(path).read_text(encoding="utf-8")
     blocks = raw.split("---")
 
@@ -94,73 +78,22 @@ def parse_script(path: str):
 
     if not scenes:
         raise ValueError("No scenes found. Separate scenes with '---' lines.")
-
     return settings, scenes
 
 
-# --------------------------------------------------------------------------
-# 2. Narration + word-accurate captions (edge-tts)
-# --------------------------------------------------------------------------
-
 async def _synthesize(text: str, voice: str, out_mp3: Path):
     communicate = edge_tts.Communicate(text, voice)
-    boundaries = []
     with open(out_mp3, "wb") as f:
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 f.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                boundaries.append(chunk)
-    return boundaries
 
 
 def synthesize_narration(text: str, voice: str, out_mp3: Path):
-    """Runs edge-tts and returns word boundary timing (list of dicts)."""
-    return asyncio.run(_synthesize(text, voice, out_mp3))
+    asyncio.run(_synthesize(text, voice, out_mp3))
 
 
-def _fmt_srt_time(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
-    h, ms = divmod(ms, 3_600_000)
-    m, ms = divmod(ms, 60_000)
-    s, ms = divmod(ms, 1000)
-    return f"{h:02}:{m:02}:{s:02},{ms:03}"
-
-
-def build_srt(boundaries, out_srt: Path, words_per_caption=WORDS_PER_CAPTION):
-    """Groups word boundaries into short caption chunks with real timing."""
-    if not boundaries:
-        out_srt.write_text("", encoding="utf-8")
-        return
-
-    entries = []
-    chunk = []
-    for wb in boundaries:
-        chunk.append(wb)
-        ends_clause = wb["text"].strip().endswith((".", "!", "?", ",", "\u060c", "\u061f"))
-        if len(chunk) >= words_per_caption or ends_clause:
-            entries.append(chunk)
-            chunk = []
-    if chunk:
-        entries.append(chunk)
-
-    lines = []
-    for i, group in enumerate(entries, start=1):
-        start = group[0]["offset"] / 1e7
-        end = (group[-1]["offset"] + group[-1]["duration"]) / 1e7
-        text = " ".join(w["text"] for w in group)
-        lines.append(str(i))
-        lines.append(f"{_fmt_srt_time(start)} --> {_fmt_srt_time(end)}")
-        lines.append(text)
-        lines.append("")
-    out_srt.write_text("\n".join(lines), encoding="utf-8")
-
-
-# --------------------------------------------------------------------------
-# 3. Image generation (Pollinations.ai -- free, no key)
-# --------------------------------------------------------------------------
-
-def fetch_image(prompt: str, out_path: Path, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT, retries=4):
+def fetch_image(prompt: str, out_path: Path, width=CANVAS_W, height=CANVAS_H, retries=4):
     seed = random.randint(1, 999_999)
     url = f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}&seed={seed}&nologo=true"
     last_err = None
@@ -169,7 +102,7 @@ def fetch_image(prompt: str, out_path: Path, width=DEFAULT_WIDTH, height=DEFAULT
             resp = requests.get(url, timeout=120)
             resp.raise_for_status()
             out_path.write_bytes(resp.content)
-            if out_path.stat().st_size > 5000:  # sanity check, not an error page
+            if out_path.stat().st_size > 5000:
                 return
             last_err = "image response too small"
         except Exception as e:  # noqa: BLE001
@@ -179,14 +112,10 @@ def fetch_image(prompt: str, out_path: Path, width=DEFAULT_WIDTH, height=DEFAULT
     raise RuntimeError(f"Failed to fetch image for prompt {prompt!r}: {last_err}")
 
 
-# --------------------------------------------------------------------------
-# 4. ffmpeg helpers
-# --------------------------------------------------------------------------
-
-def run(cmd):
-    result = subprocess.run(cmd, capture_output=True, text=True)
+def run(cmd, **kwargs):
+    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
     if result.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{result.stderr[-3000:]}")
+        raise RuntimeError(f"Command failed: {' '.join(str(c) for c in cmd)}\n{result.stderr[-3000:]}")
     return result
 
 
@@ -198,43 +127,176 @@ def get_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
-KEN_BURNS_PRESETS = [
-    "z='min(zoom+0.0015,1.3)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-    "z='if(lte(zoom,1.0),1.3,max(1.001,zoom-0.0015))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'",
-    "z='min(zoom+0.0012,1.25)':x='iw/2-(iw/zoom/2)+50*sin(on/200)':y='ih/2-(ih/zoom/2)'",
-]
+def mp3_to_wav(mp3_path: Path, wav_path: Path):
+    run(["ffmpeg", "-y", "-i", str(mp3_path), "-ar", "22050", "-ac", "1", str(wav_path), "-loglevel", "error"])
 
 
-def build_scene_clip(image_path: Path, audio_path: Path, srt_path: Path,
-                      duration: float, out_path: Path, scene_idx: int,
-                      width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT, fps=DEFAULT_FPS):
-    frames = max(int(duration * fps), fps)
-    kb = KEN_BURNS_PRESETS[scene_idx % len(KEN_BURNS_PRESETS)]
+def run_rhubarb(wav_path: Path, out_json: Path, rhubarb_bin="rhubarb"):
+    """Runs Rhubarb Lip Sync and returns a list of {start, end, value} mouth cues."""
+    try:
+        run([
+            rhubarb_bin, "-f", "json", "-o", str(out_json),
+            "--recognizer", "phonetic",
+            str(wav_path),
+        ])
+        data = json.loads(out_json.read_text(encoding="utf-8"))
+        return data.get("mouthCues", [])
+    except Exception as e:  # noqa: BLE001
+        print(f"  [lipsync] Rhubarb unavailable/failed ({e}); falling back to a simple approximation.")
+        return None
 
-    vf_parts = [
-        "scale=8000:-1",
-        f"zoompan={kb}:d={frames}:s={width}x{height}:fps={fps}",
-    ]
-    if srt_path.exists() and srt_path.stat().st_size > 0:
-        escaped = str(srt_path).replace("\\", "/").replace(":", "\\:")
-        vf_parts.append(
-            f"subtitles={escaped}:force_style='FontName=DejaVu Sans,FontSize=30,"
-            f"PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,"
-            f"Outline=2,Shadow=0,Alignment=2,MarginV=70'"
-        )
-    vf = ",".join(vf_parts)
 
-    run([
+def approximate_mouth_cues(wav_path: Path, duration: float):
+    """Fallback if Rhubarb isn't installed: derive rough mouth movement from audio volume."""
+    import wave
+    import audioop
+
+    cues = []
+    try:
+        with wave.open(str(wav_path), "rb") as wf:
+            framerate = wf.getframerate()
+            chunk_ms = 90
+            chunk_frames = int(framerate * chunk_ms / 1000)
+            t = 0.0
+            while True:
+                frames = wf.readframes(chunk_frames)
+                if not frames:
+                    break
+                rms = audioop.rms(frames, wf.getsampwidth())
+                if rms < 200:
+                    letter = "X"
+                elif rms < 800:
+                    letter = "B"
+                elif rms < 2000:
+                    letter = "C"
+                else:
+                    letter = "D"
+                cues.append({"start": t, "end": t + chunk_ms / 1000, "value": letter})
+                t += chunk_ms / 1000
+    except Exception as e:  # noqa: BLE001
+        print(f"  [lipsync] fallback also failed ({e}); using static mid-mouth for whole clip.")
+        cues = [{"start": 0, "end": duration, "value": "C"}]
+    return cues
+
+
+def mouth_state_at(cues, t: float) -> str:
+    for cue in cues:
+        if cue["start"] <= t < cue["end"]:
+            return VISEME_MAP.get(cue["value"], "closed")
+    return "closed"
+
+
+class CharacterRig:
+    def __init__(self, character_dir: Path):
+        cfg = json.loads((character_dir / "rig.json").read_text())
+        self.left_eye_pos = tuple(cfg["left_eye_pos"])
+        self.right_eye_pos = tuple(cfg["right_eye_pos"])
+        self.mouth_pos = tuple(cfg["mouth_pos"])
+        self.canvas_size = tuple(cfg["canvas_size"])
+
+        base = Image.open(character_dir / "base.png").convert("RGBA")
+        eye_l_open = Image.open(character_dir / "eye_l_open.png")
+        eye_r_open = Image.open(character_dir / "eye_r_open.png")
+        eye_closed = Image.open(character_dir / "eye_closed.png")
+        mouths = {
+            "closed": Image.open(character_dir / "mouth_closed.png"),
+            "mid": Image.open(character_dir / "mouth_mid.png"),
+            "wide": Image.open(character_dir / "mouth_wide.png"),
+        }
+
+        self.frames = {}
+        for eyes_state in ("open", "closed"):
+            for mouth_state, mouth_img in mouths.items():
+                frame = base.copy()
+                if eyes_state == "open":
+                    frame.paste(eye_l_open, self.left_eye_pos, eye_l_open)
+                    frame.paste(eye_r_open, self.right_eye_pos, eye_r_open)
+                else:
+                    frame.paste(eye_closed, self.left_eye_pos, eye_closed)
+                    frame.paste(eye_closed, self.right_eye_pos, eye_closed)
+                frame.paste(mouth_img, self.mouth_pos, mouth_img)
+                self.frames[(eyes_state, mouth_state)] = frame
+
+    def get(self, eyes_state: str, mouth_state: str) -> Image.Image:
+        return self.frames[(eyes_state, mouth_state)]
+
+
+def make_blink_schedule(duration: float, min_gap=2.5, max_gap=5.5, blink_len=0.14):
+    schedule = []
+    t = random.uniform(1.0, min_gap)
+    while t < duration:
+        schedule.append((t, t + blink_len))
+        t += random.uniform(min_gap, max_gap)
+    return schedule
+
+
+def is_blinking(schedule, t: float) -> bool:
+    for start, end in schedule:
+        if start <= t < end:
+            return True
+    return False
+
+
+def prepare_background(image_path: Path, width, height) -> Image.Image:
+    img = Image.open(image_path).convert("RGB")
+    src_ratio = img.width / img.height
+    dst_ratio = width / height
+    if src_ratio > dst_ratio:
+        new_h = height
+        new_w = int(height * src_ratio)
+    else:
+        new_w = width
+        new_h = int(width / src_ratio)
+    img = img.resize((new_w, new_h))
+    left = (new_w - width) // 2
+    top = (new_h - height) // 2
+    return img.crop((left, top, left + width, top + height))
+
+
+def render_scene(background: Image.Image, rig: CharacterRig, mouth_cues, blink_schedule,
+                  duration: float, audio_path: Path, out_path: Path,
+                  char_scale=0.85, fps=FPS):
+    char_h = int(CANVAS_H * char_scale)
+    char_w = int(char_h * rig.canvas_size[0] / rig.canvas_size[1])
+    anchor_x = (CANVAS_W - char_w) // 2
+    anchor_y = CANVAS_H - char_h + 20
+
+    resized_cache = {
+        key: img.resize((char_w, char_h), Image.LANCZOS)
+        for key, img in rig.frames.items()
+    }
+
+    total_frames = max(int(duration * fps), fps)
+
+    ffmpeg_cmd = [
         "ffmpeg", "-y",
-        "-loop", "1", "-i", str(image_path),
+        "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{CANVAS_W}x{CANVAS_H}", "-r", str(fps),
+        "-i", "-",
         "-i", str(audio_path),
-        "-vf", vf,
         "-c:v", "libx264", "-pix_fmt", "yuv420p",
-        "-t", f"{duration:.3f}",
         "-c:a", "aac", "-shortest",
-        str(out_path),
-        "-loglevel", "error",
-    ])
+        str(out_path), "-loglevel", "error",
+    ]
+    proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+
+    bg_rgba = background.convert("RGBA")
+
+    for i in range(total_frames):
+        t = i / fps
+        mouth_state = mouth_state_at(mouth_cues, t) if mouth_cues else "closed"
+        eyes_state = "closed" if is_blinking(blink_schedule, t) else "open"
+        char_img = resized_cache[(eyes_state, mouth_state)]
+
+        bob = int(5 * math.sin(2 * math.pi * t / 2.6))
+        frame = bg_rgba.copy()
+        frame.alpha_composite(char_img, (anchor_x, anchor_y + bob))
+
+        proc.stdin.write(frame.convert("RGB").tobytes())
+
+    proc.stdin.close()
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg frame encoding failed for {out_path}")
 
 
 def concat_clips(clip_paths, out_path: Path, workdir: Path):
@@ -260,19 +322,15 @@ def add_background_music(video_path: Path, music_path: Path, out_path: Path, vol
     ])
 
 
-# --------------------------------------------------------------------------
-# 5. Orchestration
-# --------------------------------------------------------------------------
-
 def main():
-    ap = argparse.ArgumentParser(description="Generate a long-form AI video from a script.")
-    ap.add_argument("--script", required=True, help="Path to the script .txt file")
-    ap.add_argument("--out", default="output/final_video.mp4", help="Output video path")
-    ap.add_argument("--voice", default=None, help="Override the TTS voice for all scenes")
-    ap.add_argument("--music", default=None, help="Override/add a background music file")
-    ap.add_argument("--width", type=int, default=DEFAULT_WIDTH)
-    ap.add_argument("--height", type=int, default=DEFAULT_HEIGHT)
-    ap.add_argument("--keep-temp", action="store_true", help="Keep intermediate files")
+    ap = argparse.ArgumentParser(description="Generate an animated talking-character video from a script.")
+    ap.add_argument("--script", required=True)
+    ap.add_argument("--out", default="output/final_video.mp4")
+    ap.add_argument("--voice", default=None)
+    ap.add_argument("--music", default=None)
+    ap.add_argument("--character-scale", type=float, default=0.85)
+    ap.add_argument("--rhubarb-bin", default="rhubarb")
+    ap.add_argument("--keep-temp", action="store_true")
     args = ap.parse_args()
 
     settings, scenes = parse_script(args.script)
@@ -287,26 +345,35 @@ def main():
     workdir.mkdir(parents=True)
 
     print(f"Loaded {len(scenes)} scene(s). Voice: {voice}. Music: {music or 'none'}")
+    rig = CharacterRig(CHARACTER_DIR)
 
     clip_paths = []
     for i, scene in enumerate(scenes):
-        print(f"\n[{i+1}/{len(scenes)}] Narration: {scene['narration'][:70]}...")
-        audio_path = workdir / f"scene_{i:03}.mp3"
-        srt_path = workdir / f"scene_{i:03}.srt"
+        print(f"\n[{i+1}/{len(scenes)}] {scene['narration'][:70]}...")
+        audio_mp3 = workdir / f"scene_{i:03}.mp3"
+        audio_wav = workdir / f"scene_{i:03}.wav"
         image_path = workdir / f"scene_{i:03}.jpg"
+        rhubarb_json = workdir / f"scene_{i:03}_mouth.json"
         clip_path = workdir / f"scene_{i:03}.mp4"
 
-        print("  -> generating narration + captions (edge-tts)")
-        boundaries = synthesize_narration(scene["narration"], voice, audio_path)
-        build_srt(boundaries, srt_path)
-        duration = get_duration(audio_path) + 0.4  # small tail padding
+        print("  -> generating narration (edge-tts)")
+        synthesize_narration(scene["narration"], voice, audio_mp3)
+        duration = get_duration(audio_mp3) + 0.3
+        mp3_to_wav(audio_mp3, audio_wav)
 
-        print(f"  -> generating image: {scene['image_prompt'][:70]}...")
-        fetch_image(scene["image_prompt"], image_path, args.width, args.height)
+        print("  -> computing lip-sync (Rhubarb)")
+        mouth_cues = run_rhubarb(audio_wav, rhubarb_json, args.rhubarb_bin)
+        if mouth_cues is None:
+            mouth_cues = approximate_mouth_cues(audio_wav, duration)
+        blink_schedule = make_blink_schedule(duration)
 
-        print(f"  -> rendering scene clip ({duration:.1f}s)")
-        build_scene_clip(image_path, audio_path, srt_path, duration, clip_path, i,
-                          args.width, args.height)
+        print(f"  -> generating background: {scene['image_prompt'][:70]}...")
+        fetch_image(scene["image_prompt"], image_path, CANVAS_W, CANVAS_H)
+        background = prepare_background(image_path, CANVAS_W, CANVAS_H)
+
+        print(f"  -> rendering animated scene ({duration:.1f}s, {int(duration*FPS)} frames)")
+        render_scene(background, rig, mouth_cues, blink_schedule, duration, audio_mp3,
+                     clip_path, char_scale=args.character_scale)
         clip_paths.append(clip_path)
 
     print("\nConcatenating all scenes...")
