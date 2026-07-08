@@ -1,18 +1,8 @@
 {
-  "canvas_size": [
-    314,
-    486
-  ],
-  "left_eye_pos": [
-    105,
-    144
-  ],
-  "right_eye_pos": [
-    170,
-    144
-  ],
-  "mouth_pos": [
-    134,
-    190
-  ]
+  "canvas_size": [314, 486],
+  "left_eye_pos": [105, 144],
+  "right_eye_pos": [170, 144],
+  "mouth_pos": [134, 190],
+  "right_arm_idle_pos": [191, 299],
+  "right_arm_raised_pos": [98, 195]
 }

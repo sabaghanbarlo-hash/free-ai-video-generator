@@ -4,7 +4,7 @@ Free AI Animated Video Generator
 ----------------------------------
 Turns a plain-text script into a video of YOUR character actually talking:
 real word-accurate lip-sync (Rhubarb Lip Sync), blinking, a subtle idle bob,
-and AI-generated scene backgrounds behind it (Pollinations.ai) -- all free,
+gesture animation, and AI-generated anime-style scene backgrounds -- all free,
 no API keys, fully automatable.
 
 Usage:
@@ -31,8 +31,11 @@ DEFAULT_VOICE = "en-US-AriaNeural"
 CANVAS_W, CANVAS_H = 1920, 1080
 FPS = 25
 POLLINATIONS_BASE = "https://image.pollinations.ai/prompt"
+ANIME_STYLE_SUFFIX = (", anime background art, cel shaded, Studio Ghibli inspired, hand-painted anime "
+                      "illustration, vibrant anime color palette, no photorealism")
 CHARACTER_DIR = Path(__file__).parent / "assets" / "character"
 
+# Rhubarb mouth-shape letters -> our 3 puppet mouth states
 VISEME_MAP = {
     "A": "closed", "B": "closed", "G": "closed", "X": "closed",
     "C": "mid", "E": "mid", "F": "mid", "H": "mid",
@@ -95,11 +98,16 @@ def synthesize_narration(text: str, voice: str, out_mp3: Path):
 
 def fetch_image(prompt: str, out_path: Path, width=CANVAS_W, height=CANVAS_H, retries=4):
     seed = random.randint(1, 999_999)
-    url = f"{POLLINATIONS_BASE}/{quote(prompt)}?width={width}&height={height}&seed={seed}&nologo=true"
+    styled_prompt = f"{prompt}{ANIME_STYLE_SUFFIX}"
+    url = (f"{POLLINATIONS_BASE}/{quote(styled_prompt)}?width={width}&height={height}"
+           f"&seed={seed}&nologo=true&model=flux-anime")
+    fallback_url = (f"{POLLINATIONS_BASE}/{quote(styled_prompt)}?width={width}&height={height}"
+                     f"&seed={seed}&nologo=true")
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            resp = requests.get(url, timeout=120)
+            try_url = url if attempt <= retries - 1 else fallback_url
+            resp = requests.get(try_url, timeout=120)
             resp.raise_for_status()
             out_path.write_bytes(resp.content)
             if out_path.stat().st_size > 5000:
@@ -193,6 +201,8 @@ class CharacterRig:
         self.right_eye_pos = tuple(cfg["right_eye_pos"])
         self.mouth_pos = tuple(cfg["mouth_pos"])
         self.canvas_size = tuple(cfg["canvas_size"])
+        self.right_arm_idle_pos = tuple(cfg["right_arm_idle_pos"])
+        self.right_arm_raised_pos = tuple(cfg["right_arm_raised_pos"])
 
         base = Image.open(character_dir / "base.png").convert("RGBA")
         eye_l_open = Image.open(character_dir / "eye_l_open.png")
@@ -203,22 +213,28 @@ class CharacterRig:
             "mid": Image.open(character_dir / "mouth_mid.png"),
             "wide": Image.open(character_dir / "mouth_wide.png"),
         }
+        arms = {
+            "idle": (Image.open(character_dir / "arm_idle.png").convert("RGBA"), self.right_arm_idle_pos),
+            "raised": (Image.open(character_dir / "arm_raised.png").convert("RGBA"), self.right_arm_raised_pos),
+        }
 
         self.frames = {}
         for eyes_state in ("open", "closed"):
             for mouth_state, mouth_img in mouths.items():
-                frame = base.copy()
-                if eyes_state == "open":
-                    frame.paste(eye_l_open, self.left_eye_pos, eye_l_open)
-                    frame.paste(eye_r_open, self.right_eye_pos, eye_r_open)
-                else:
-                    frame.paste(eye_closed, self.left_eye_pos, eye_closed)
-                    frame.paste(eye_closed, self.right_eye_pos, eye_closed)
-                frame.paste(mouth_img, self.mouth_pos, mouth_img)
-                self.frames[(eyes_state, mouth_state)] = frame
+                for arm_state, (arm_img, arm_pos) in arms.items():
+                    frame = base.copy()
+                    frame.paste(arm_img, arm_pos, arm_img)
+                    if eyes_state == "open":
+                        frame.paste(eye_l_open, self.left_eye_pos, eye_l_open)
+                        frame.paste(eye_r_open, self.right_eye_pos, eye_r_open)
+                    else:
+                        frame.paste(eye_closed, self.left_eye_pos, eye_closed)
+                        frame.paste(eye_closed, self.right_eye_pos, eye_closed)
+                    frame.paste(mouth_img, self.mouth_pos, mouth_img)
+                    self.frames[(eyes_state, mouth_state, arm_state)] = frame
 
-    def get(self, eyes_state: str, mouth_state: str) -> Image.Image:
-        return self.frames[(eyes_state, mouth_state)]
+    def get(self, eyes_state: str, mouth_state: str, arm_state: str) -> Image.Image:
+        return self.frames[(eyes_state, mouth_state, arm_state)]
 
 
 def make_blink_schedule(duration: float, min_gap=2.5, max_gap=5.5, blink_len=0.14):
@@ -235,6 +251,23 @@ def is_blinking(schedule, t: float) -> bool:
         if start <= t < end:
             return True
     return False
+
+
+def make_gesture_schedule(duration: float, min_gap=3.5, max_gap=7.0, gesture_len=1.3):
+    """Periodically raises the character's arm for a natural talking-gesture feel."""
+    schedule = []
+    t = random.uniform(1.5, min_gap)
+    while t < duration - gesture_len * 0.5:
+        schedule.append((t, t + gesture_len))
+        t += random.uniform(min_gap, max_gap)
+    return schedule
+
+
+def arm_state_at(schedule, t: float) -> str:
+    for start, end in schedule:
+        if start <= t < end:
+            return "raised"
+    return "idle"
 
 
 def prepare_background(image_path: Path, width, height) -> Image.Image:
@@ -254,7 +287,7 @@ def prepare_background(image_path: Path, width, height) -> Image.Image:
 
 
 def render_scene(background: Image.Image, rig: CharacterRig, mouth_cues, blink_schedule,
-                  duration: float, audio_path: Path, out_path: Path,
+                  gesture_schedule, duration: float, audio_path: Path, out_path: Path,
                   char_scale=0.85, fps=FPS):
     char_h = int(CANVAS_H * char_scale)
     char_w = int(char_h * rig.canvas_size[0] / rig.canvas_size[1])
@@ -285,7 +318,8 @@ def render_scene(background: Image.Image, rig: CharacterRig, mouth_cues, blink_s
         t = i / fps
         mouth_state = mouth_state_at(mouth_cues, t) if mouth_cues else "closed"
         eyes_state = "closed" if is_blinking(blink_schedule, t) else "open"
-        char_img = resized_cache[(eyes_state, mouth_state)]
+        arm_state = arm_state_at(gesture_schedule, t)
+        char_img = resized_cache[(eyes_state, mouth_state, arm_state)]
 
         bob = int(5 * math.sin(2 * math.pi * t / 2.6))
         frame = bg_rgba.copy()
@@ -366,14 +400,15 @@ def main():
         if mouth_cues is None:
             mouth_cues = approximate_mouth_cues(audio_wav, duration)
         blink_schedule = make_blink_schedule(duration)
+        gesture_schedule = make_gesture_schedule(duration)
 
         print(f"  -> generating background: {scene['image_prompt'][:70]}...")
         fetch_image(scene["image_prompt"], image_path, CANVAS_W, CANVAS_H)
         background = prepare_background(image_path, CANVAS_W, CANVAS_H)
 
         print(f"  -> rendering animated scene ({duration:.1f}s, {int(duration*FPS)} frames)")
-        render_scene(background, rig, mouth_cues, blink_schedule, duration, audio_mp3,
-                     clip_path, char_scale=args.character_scale)
+        render_scene(background, rig, mouth_cues, blink_schedule, gesture_schedule, duration,
+                     audio_mp3, clip_path, char_scale=args.character_scale)
         clip_paths.append(clip_path)
 
     print("\nConcatenating all scenes...")
