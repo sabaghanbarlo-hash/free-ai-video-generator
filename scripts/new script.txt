@@ -1,0 +1,12 @@
+VOICE: en-US-AriaNeural
+MUSIC:
+
+---
+IMAGE: a cozy coffee shop window on a rainy autumn day, warm golden light, aesthetic film photography
+Rain taps gently against the window as steam rises slowly from a fresh cup of coffee. There's a certain kind of peace in moments like this.
+---
+IMAGE: a person journaling by candlelight in a cozy bedroom, warm tones, soft focus
+There's something quietly powerful about writing your thoughts down before bed. It's not about being productive. It's about making space to actually hear yourself think.
+---
+IMAGE: a small notebook and a cup of tea on a wooden table by a window, soft morning light
+Slowing down doesn't mean falling behind. Sometimes the slowest mornings lead to the clearest days.
